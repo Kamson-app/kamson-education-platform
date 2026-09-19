@@ -641,6 +641,76 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
   }
 };
 
+  const handleResendVerification = async () => {
+    setError("");
+    setSuccess("");
+
+    const normalizedEmail = email.trim();
+
+    if (!normalizedEmail) {
+      setError("Veuillez saisir votre adresse e-mail.");
+      return;
+    }
+
+    if (!password) {
+      setError("Veuillez saisir votre mot de passe pour renvoyer l'e-mail de vérification.");
+      return;
+    }
+
+    try {
+      setLoading(true);
+
+      // Connexion temporaire pour obtenir l'objet Firebase User.
+      const credential = await signInWithEmailAndPassword(
+        auth,
+        normalizedEmail,
+        password
+      );
+
+      const user = credential.user;
+
+      if (user.emailVerified) {
+        await signOut(auth);
+        setSuccess("Votre adresse e-mail est déjà vérifiée. Vous pouvez vous connecter.");
+        return;
+      }
+
+      await sendEmailVerification(user);
+      await signOut(auth);
+
+      setSuccess(
+        "Un nouvel e-mail de vérification a été envoyé. Consultez votre boîte de réception et vos courriers indésirables."
+      );
+    } catch (err: unknown) {
+      console.error("Erreur lors du renvoi de l'e-mail de vérification :", err);
+
+      if (err instanceof FirebaseError) {
+        switch (err.code) {
+          case "auth/invalid-email":
+            setError("L'adresse e-mail est invalide.");
+            break;
+          case "auth/invalid-credential":
+          case "auth/wrong-password":
+          case "auth/user-not-found":
+            setError("Adresse e-mail ou mot de passe incorrect.");
+            break;
+          case "auth/too-many-requests":
+            setError("Trop de tentatives. Veuillez patienter quelques instants avant de réessayer.");
+            break;
+          case "auth/network-request-failed":
+            setError("Impossible de contacter Firebase. Vérifiez votre connexion Internet.");
+            break;
+          default:
+            setError(formatAuthError(err));
+        }
+      } else {
+        setError(formatAuthError(err));
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleGoogleLogin = async () => {
     setError("");
     try {
@@ -828,6 +898,20 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
               </div>
 
               <button type="submit" disabled={loading} className="w-full py-3 rounded-xl bg-green-700 hover:bg-green-800 text-white font-bold transition flex justify-center items-center gap-2"><LogIn size={18} /> {loading ? "Connexion..." : "Se connecter"}</button>
+
+              <div className="text-center pt-1">
+                <button
+                  type="button"
+                  onClick={handleResendVerification}
+                  disabled={loading}
+                  className="text-sm font-semibold text-green-700 hover:text-green-800 hover:underline disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {loading ? "Envoi en cours..." : "Renvoyer l'e-mail de vérification"}
+                </button>
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Saisissez votre e-mail et votre mot de passe avant de cliquer.
+                </p>
+              </div>
             </form>
           )}
 
