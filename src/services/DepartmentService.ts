@@ -15,70 +15,153 @@ import {
 import { db } from "../firebaseConfig";
 import type { EstablishmentSettings } from "../types";
 
-const COLLECTION = "departmentSettings";
+/**
+ * Les paramètres du département sont stockés
+ * dans la collection Firestore "departments".
+ *
+ * Le departmentId du profil utilisateur correspond
+ * directement à l'identifiant du document Firestore.
+ */
+const COLLECTION = "departments";
 
 export class DepartmentService {
 
+    /**
+     * Récupère les paramètres du département.
+     */
     static async getDepartmentSettings(
         departmentId: string
     ): Promise<EstablishmentSettings | null> {
 
-        if (!departmentId) return null;
+        if (!departmentId) {
+            return null;
+        }
 
-        const ref = doc(db, COLLECTION, departmentId);
+        const ref = doc(
+            db,
+            COLLECTION,
+            departmentId
+        );
 
         const snap = await getDoc(ref);
 
-        if (!snap.exists()) return null;
+        if (!snap.exists()) {
+            return null;
+        }
 
-        return snap.data() as EstablishmentSettings;
+        return {
+            id: snap.id,
+            ...snap.data(),
+        } as EstablishmentSettings;
     }
 
+    /**
+     * Enregistre ou complète les paramètres
+     * du département sans supprimer les champs existants.
+     */
     static async saveDepartmentSettings(
         departmentId: string,
         data: Partial<EstablishmentSettings>
     ): Promise<void> {
 
-        const ref = doc(db, COLLECTION, departmentId);
+        if (!departmentId) {
+            throw new Error(
+                "Impossible d'enregistrer : département inconnu."
+            );
+        }
 
-        await setDoc(ref, data, { merge: true });
+        const ref = doc(
+            db,
+            COLLECTION,
+            departmentId
+        );
+
+        await setDoc(
+            ref,
+            {
+                ...data,
+                id: departmentId,
+            },
+            {
+                merge: true,
+            }
+        );
     }
 
+    /**
+     * Met à jour les paramètres existants
+     * du département.
+     */
     static async updateDepartmentSettings(
         departmentId: string,
         data: Partial<EstablishmentSettings>
     ): Promise<void> {
 
-        const ref = doc(db, COLLECTION, departmentId);
+        if (!departmentId) {
+            throw new Error(
+                "Impossible de mettre à jour : département inconnu."
+            );
+        }
 
-        await updateDoc(ref, data);
+        const ref = doc(
+            db,
+            COLLECTION,
+            departmentId
+        );
+
+        await updateDoc(
+            ref,
+            data
+        );
     }
 
+    /**
+     * Écoute en temps réel les paramètres
+     * du département.
+     */
     static subscribe(
-
         departmentId: string,
-
         callback: (
             settings: EstablishmentSettings | null
         ) => void
-
     ): Unsubscribe {
 
-        const ref = doc(db, COLLECTION, departmentId);
+        if (!departmentId) {
+            callback(null);
 
-        return onSnapshot(ref, (snapshot) => {
+            return () => {};
+        }
 
-            if (!snapshot.exists()) {
+        const ref = doc(
+            db,
+            COLLECTION,
+            departmentId
+        );
+
+        return onSnapshot(
+            ref,
+            (snapshot) => {
+
+                if (!snapshot.exists()) {
+                    callback(null);
+
+                    return;
+                }
+
+                callback({
+                    id: snapshot.id,
+                    ...snapshot.data(),
+                } as EstablishmentSettings);
+            },
+            (error) => {
+
+                console.error(
+                    "[DepartmentService] Erreur de synchronisation :",
+                    error
+                );
 
                 callback(null);
-
-                return;
             }
-
-            callback(snapshot.data() as EstablishmentSettings);
-
-        });
-
+        );
     }
-
 }

@@ -67,10 +67,18 @@ export const DepartmentProvider: React.FC<{
 
     const load = useCallback(async () => {
 
+        // Le profil utilisateur est encore en cours de chargement.
+        // On ne doit pas afficher "Aucun département trouvé" dans ce cas.
+        if (!profile) {
+            setLoading(true);
+            setError(null);
+            return;
+        }
+
         if (!departmentId) {
 
             console.warn(
-                "[DepartmentProvider] Aucun département trouvé."
+                "[DepartmentProvider] Aucun département trouvé dans le profil."
             );
 
             setSettings(null);
@@ -122,13 +130,13 @@ export const DepartmentProvider: React.FC<{
 
         }
 
-    }, [departmentId]);
+    }, [departmentId, profile]);
 
     useEffect(() => {
 
         load();
 
-    }, [departmentId, load]);
+    }, [load]);
 
     useEffect(() => {
 

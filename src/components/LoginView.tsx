@@ -171,9 +171,14 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
           return "Cette adresse e-mail est déjà utilisée.";
         case "auth/weak-password":
           return "Le mot de passe est trop faible.";
+        case "auth/invalid-email":
+          return "L'adresse e-mail est invalide.";
         default:
-          return "Une erreur est survenue lors de l'authentification.";
+          return `${err.code} : ${err.message}`;
       }
+    }
+    if (err instanceof Error) {
+      return err.message;
     }
     return "Une erreur inattendue est survenue.";
   };
@@ -272,8 +277,8 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
         };
       }
     } catch (e) {
-      console.error(`Erreur d'ajout de la référence dans ${collectionName} :`, e);
-      return { id: "", name: rawVal };
+      console.error(`Erreur Firestore dans ${collectionName} :`, e);
+      throw e;
     }
   };
 
@@ -324,7 +329,7 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
       }
     } catch (e) {
       console.error("Erreur lors de la récupération/création du département Firestore :", e);
-      return "";
+      throw e;
     }
   };
 
@@ -374,7 +379,7 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
 
         weeklyHours: profileData.weeklyHours,
 
-        academicYear: establishment?.academicYear || "2025/2026",
+        academicYear: establishment.academicYear,
 
         subject: profileData.subject,
         school: profileData.school,
@@ -440,134 +445,201 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
   }
 
   const handleRegister = async (e: React.FormEvent) => {
-    e.preventDefault(); setError(""); setSuccess("");
-    
-    const targetSchool = schoolQuery.trim();
-    const targetSubject = subjectQuery.trim();
-
-    if (
-      !fullName.trim() ||
-      !matricule.trim() ||
-      !email.trim() ||
-      !password ||
-      !phone.trim() ||
-      !targetSchool ||
-      !targetSubject ||
-      !grade.trim() ||
-      !classesTaught.trim() ||
-      !weeklyHours.trim()
-    ) {
-      return setError(
-        "Veuillez renseigner toutes les informations obligatoires."
-      );
-    }
-
-    const parsedWeeklyHours = Number(weeklyHours);
-    if (
-      !Number.isFinite(parsedWeeklyHours) ||
-      parsedWeeklyHours <= 0
-    ) {
-      return setError(
-        "Le volume horaire hebdomadaire doit être un nombre supérieur à 0."
-      );
-    }
-
-    const parsedClasses = classesTaught
-      .split(",")
-      .map(c => c.trim())
-      .filter(Boolean);
-
-    if (parsedClasses.length === 0) {
-      return setError(
-        "Veuillez renseigner au moins une classe enseignée."
-      );
-    }
-    
-    if (!validatePassword(password)) {
-      return setError("Le mot de passe doit contenir au moins 8 caractères, une lettre majuscule et un chiffre.");
-    }
-
-    try {
-      setLoading(true);
-      
-      const finalSchool = await checkAndCreateReference("schools", targetSchool);
-      const finalSubject = await checkAndCreateReference("subjects", targetSubject);
-      
-      const realDepartmentId = await checkAndCreateDepartment(finalSchool.id, finalSubject.name);
-      if (!realDepartmentId) {
-        throw new Error("Impossible de déterminer le département. Inscription annulée.");
-      }
-
-      const credential = await createUserWithEmailAndPassword(auth, email, password);
-      
-      await updateProfile(credential.user, { displayName: fullName });
-      await sendEmailVerification(credential.user);
-
-      await createUserProfile(
-        credential.user,
-        {
-          fullName: fullName.trim(),
-          matricule: matricule.trim(),
-          phone: phone.trim(),
-          school: finalSchool.name,
-          subject: finalSubject.name,
-          grade: grade.trim(),
-          classes: parsedClasses,
-          weeklyHours: parsedWeeklyHours,
-          establishmentId: finalSchool.id,
-          departmentId: realDepartmentId,
-          role
-        }
-      );
-      
-      const targetMessage = "Compte créé avec succès. Un e-mail de vérification vous a été envoyé. Veuillez le confirmer avant de vous connecter.";
-      
-      clearForm({ keepSuccessMessage: true });
-      setSuccess(targetMessage);
-      
-      await signOut(auth);
-      setMode("login");
-    } catch (err: unknown) { 
-      console.error(err); 
-      setError(formatAuthError(err)); 
-    } finally { setLoading(false); }
-  };
-
-  const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-
     setError("");
     setSuccess("");
     setLoading(true);
-
     try {
-      const credential = await signInWithEmailAndPassword(
+      console.log("ÉTAPE 1 : début inscription");
+      const targetSchool = schoolQuery.trim();
+      const targetSubject = subjectQuery.trim();
+      if (
+        !fullName.trim() ||
+        !matricule.trim() ||
+        !email.trim() ||
+        !password ||
+        !phone.trim() ||
+        !targetSchool ||
+        !targetSubject ||
+        !grade.trim() ||
+        !classesTaught.trim() ||
+        !weeklyHours.trim()
+      ) {
+        throw new Error(
+          "Veuillez renseigner toutes les informations obligatoires."
+        );
+      }
+      if (!validatePassword(password)) {
+        throw new Error(
+          "Le mot de passe doit contenir au moins 8 caractères, une lettre majuscule et un chiffre."
+        );
+      }
+      const parsedWeeklyHours = Number(weeklyHours);
+      if (!Number.isFinite(parsedWeeklyHours) || parsedWeeklyHours <= 0) {
+        throw new Error(
+          "Le volume horaire hebdomadaire doit être supérieur à 0."
+        );
+      }
+      const parsedClasses = classesTaught
+        .split(",")
+        .map((c) => c.trim())
+        .filter(Boolean);
+
+      const finalSchool = await checkAndCreateReference(
+        "schools",
+        targetSchool
+      );
+      console.log("ÉTAPE 2 : établissement obtenu", finalSchool);
+
+      const finalSubject = await checkAndCreateReference(
+        "subjects",
+        targetSubject
+      );
+      console.log("ÉTAPE 3 : discipline obtenue", finalSubject);
+
+      const realDepartmentId = await checkAndCreateDepartment(
+        finalSchool.id,
+        finalSubject.name
+      );
+      console.log("ÉTAPE 4 : département obtenu", realDepartmentId);
+      if (!realDepartmentId) {
+        throw new Error("Département introuvable ou impossible à créer.");
+      }
+
+      console.log("ÉTAPE 5 : création du compte Firebase");
+      const credential = await createUserWithEmailAndPassword(
         auth,
         email.trim(),
         password
       );
+      console.log("ÉTAPE 6 : compte Firebase créé", credential.user.uid);
 
-      await updateLastLoginAndEmailVerification(credential.user);
-      await logActivity(credential.user.uid, "password");
-      
-      const snap = await getDoc(doc(db, "users", credential.user.uid));
-      if (!snap.exists()) {
-        await signOut(auth);
-        throw new Error("Utilisateur introuvable dans Firestore.");
-      }
-      
-      const loggedInUser = { id: credential.user.uid, ...snap.data() } as AppUser;
-      onLoginRef.current(loggedInUser);
-      
+      await updateProfile(credential.user, {
+        displayName: fullName.trim(),
+      });
+      console.log("ÉTAPE 7 : profil Firebase mis à jour");
+
+      await sendEmailVerification(credential.user);
+      console.log("ÉTAPE 8 : e-mail de vérification envoyé");
+
+      await createUserProfile(credential.user, {
+        fullName: fullName.trim(),
+        matricule: matricule.trim(),
+        phone: phone.trim(),
+        school: finalSchool.name,
+        subject: finalSubject.name,
+        grade: grade.trim(),
+        classes: parsedClasses,
+        weeklyHours: parsedWeeklyHours,
+        establishmentId: finalSchool.id,
+        departmentId: realDepartmentId,
+        role,
+      });
+      console.log("ÉTAPE 9 : profil Firestore créé");
+
+      setSuccess(
+        "Compte créé avec succès. Consultez votre e-mail pour le vérifier."
+      );
+      await signOut(auth);
+      clearForm({ keepSuccessMessage: true });
       setMode("login");
-      clearForm();
-     } catch (err: unknown) {
-      console.error("Erreur de connexion :", err);
+    } catch (err: unknown) {
+      console.error("ERREUR INSCRIPTION :", err);
       setError(formatAuthError(err));
     } finally {
+      console.log("FIN INSCRIPTION");
       setLoading(false);
     }
   };
+
+  const handleLogin = async (e: React.FormEvent) => {
+  e.preventDefault();
+
+  setError("");
+  setSuccess("");
+  setLoading(true);
+
+  try {
+    // 1. Authentification Firebase
+    const credential = await signInWithEmailAndPassword(
+      auth,
+      email.trim(),
+      password
+    );
+
+    // 2. Vérification de l'adresse e-mail
+    if (!credential.user.emailVerified) {
+      await signOut(auth);
+      setError(
+        "Veuillez vérifier votre adresse e-mail avant de vous connecter."
+      );
+      return;
+    }
+
+    // 3. Récupération du profil utilisateur
+    //    avec une limite pour éviter le chargement infini.
+    const userPromise = getDoc(
+      doc(db, "users", credential.user.uid)
+    );
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      window.setTimeout(() => {
+        reject(
+          new Error(
+            "Le profil utilisateur n'a pas pu être chargé. Vérifiez votre connexion Internet et votre connexion à Firestore."
+          )
+        );
+      }, 10000);
+    });
+
+    const snap = await Promise.race([
+      userPromise,
+      timeoutPromise
+    ]);
+
+    if (!snap.exists()) {
+      await signOut(auth);
+      throw new Error(
+        "Utilisateur introuvable dans Firestore."
+      );
+    }
+
+    const loggedInUser = {
+      id: credential.user.uid,
+      ...snap.data()
+    } as AppUser;
+
+    // 4. Connexion à l'application
+    onLoginRef.current(loggedInUser);
+
+    setMode("login");
+    clearForm();
+
+    // 5. Ces opérations sont secondaires :
+    //    elles ne doivent pas bloquer l'ouverture du dashboard.
+    void updateLastLoginAndEmailVerification(
+      credential.user
+    );
+
+    void logActivity(
+      credential.user.uid,
+      "password"
+    );
+
+  } catch (err: unknown) {
+    console.error(
+      "Erreur de connexion :",
+      err
+    );
+
+    setError(
+      formatAuthError(err)
+    );
+
+  } finally {
+    setLoading(false);
+  }
+};
 
   const handleGoogleLogin = async () => {
     setError("");
