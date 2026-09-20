@@ -22,7 +22,7 @@ import { FirebaseError } from "firebase/app";
 import { 
   doc, 
   setDoc, 
-  getDoc,
+  getDoc, 
   getDocFromServer,
   updateDoc, 
   serverTimestamp, 
@@ -189,6 +189,229 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
     const hasUpperCase = /[A-Z]/.test(pwd);
     const hasNumber = /[0-9]/.test(pwd);
     return hasMinLength && hasUpperCase && hasNumber;
+  };
+
+  // ─────────────────────────────────────────────────────────────
+  // Lecture Firestore robuste : SDK → REST automatique
+  // ─────────────────────────────────────────────────────────────
+  // Si le transport du SDK Firestore reste bloqué, nous essayons
+  // automatiquement l'API REST Firestore avec le jeton Firebase
+  // de l'utilisateur connecté.
+
+  const FIRESTORE_SDK_TIMEOUT_MS = 15000;
+  const FIRESTORE_REST_TIMEOUT_MS = 15000;
+
+  type FirestoreRestValue =
+    | { nullValue: null }
+    | { stringValue: string }
+    | { integerValue: string }
+    | { doubleValue: number }
+    | { booleanValue: boolean }
+    | { timestampValue: string }
+    | { bytesValue: string }
+    | { referenceValue: string }
+    | { geoPointValue: { latitude?: number; longitude?: number } }
+    | { arrayValue?: { values?: FirestoreRestValue[] } }
+    | { mapValue?: { fields?: Record<string, FirestoreRestValue> } };
+
+  const parseFirestoreRestValue = (value: FirestoreRestValue): unknown => {
+    if ("nullValue" in value) return null;
+    if ("stringValue" in value) return value.stringValue;
+    if ("integerValue" in value) {
+      const n = Number(value.integerValue);
+      return Number.isSafeInteger(n) ? n : value.integerValue;
+    }
+    if ("doubleValue" in value) return value.doubleValue;
+    if ("booleanValue" in value) return value.booleanValue;
+    if ("timestampValue" in value) return value.timestampValue;
+    if ("bytesValue" in value) return value.bytesValue;
+    if ("referenceValue" in value) return value.referenceValue;
+    if ("geoPointValue" in value) return value.geoPointValue;
+    if ("arrayValue" in value) {
+      return (value.arrayValue?.values ?? []).map(parseFirestoreRestValue);
+    }
+    if ("mapValue" in value) {
+      const result: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(value.mapValue?.fields ?? {})) {
+        result[key] = parseFirestoreRestValue(item);
+      }
+      return result;
+    }
+    return undefined;
+  };
+
+  const parseFirestoreRestDocument = (document: {
+    name?: string;
+    fields?: Record<string, FirestoreRestValue>;
+  }): Record<string, unknown> => {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(document.fields ?? {})) {
+      result[key] = parseFirestoreRestValue(value);
+    }
+    return result;
+  };
+
+  const fetchWithTimeout = async (
+    input: RequestInfo | URL,
+    init: RequestInit,
+    timeoutMs: number
+  ): Promise<Response> => {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      return await fetch(input, {
+        ...init,
+        signal: controller.signal,
+        cache: "no-store",
+      });
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+  };
+
+  const readUserProfileFromRest = async (
+    user: FirebaseUser
+  ): Promise<Record<string, unknown> | null> => {
+    const projectId = String(import.meta.env.VITE_FIREBASE_PROJECT_ID ?? "").trim();
+
+    if (!projectId) {
+      throw new Error(
+        "VITE_FIREBASE_PROJECT_ID est absent. Impossible d'utiliser l'API REST Firestore."
+      );
+    }
+
+    console.log("[LoginView] Test REST Firestore pour le profil utilisateur...");
+
+    const idToken = await user.getIdToken();
+    const documentPath = `users/${encodeURIComponent(user.uid)}`;
+    const url =
+      `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}` +
+      `/databases/(default)/documents/${documentPath}`;
+
+    let response: Response;
+
+    try {
+      response = await fetchWithTimeout(
+        url,
+        {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            Authorization: `Bearer ${idToken}`,
+          },
+        },
+        FIRESTORE_REST_TIMEOUT_MS
+      );
+    } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        throw new Error(
+          "REST_FIRESTORE_TIMEOUT: l'API REST Firestore n'a pas répondu après 15 secondes."
+        );
+      }
+      throw err;
+    }
+
+    if (response.status === 404) {
+      console.warn("[LoginView] REST Firestore : profil utilisateur introuvable (404).");
+      return null;
+    }
+
+    const rawText = await response.text();
+    let payload: any = null;
+
+    try {
+      payload = rawText ? JSON.parse(rawText) : null;
+    } catch {
+      payload = null;
+    }
+
+    if (!response.ok) {
+      const apiMessage =
+        payload?.error?.message ||
+        rawText ||
+        `HTTP ${response.status}`;
+      const apiCode = payload?.error?.status || `HTTP_${response.status}`;
+
+      console.error("[LoginView] REST Firestore : erreur", {
+        httpStatus: response.status,
+        code: apiCode,
+        message: apiMessage,
+      });
+
+      throw new Error(`REST_FIRESTORE_${apiCode}: ${apiMessage}`);
+    }
+
+    if (!payload?.fields) {
+      console.warn("[LoginView] REST Firestore : réponse sans champs.");
+      return {};
+    }
+
+    console.log("[LoginView] REST Firestore : lecture du profil réussie.");
+    return parseFirestoreRestDocument(payload);
+  };
+
+  const readUserProfile = async (
+    user: FirebaseUser,
+    context: "session" | "login" | "google" = "login"
+  ): Promise<{ exists: boolean; data: Record<string, unknown> | null; source: "sdk" | "rest" }> => {
+    const userRef = doc(db, "users", user.uid);
+
+    console.log(
+      `[LoginView] Lecture Firestore (${context}) users/${user.uid} avec le SDK...`
+    );
+
+    let sdkTimeoutId: number | undefined;
+    let sdkTimeoutTriggered = false;
+
+    try {
+      const sdkPromise = getDocFromServer(userRef);
+      const sdkTimeout = new Promise<never>((_, reject) => {
+        sdkTimeoutId = window.setTimeout(() => {
+          sdkTimeoutTriggered = true;
+          reject(
+            new Error(
+              "TIMEOUT_FIRESTORE: Firestore n'a pas répondu à la lecture du profil après 15 secondes."
+            )
+          );
+        }, FIRESTORE_SDK_TIMEOUT_MS);
+      });
+
+      try {
+        const snap = await Promise.race([sdkPromise, sdkTimeout]);
+        if (sdkTimeoutId !== undefined) window.clearTimeout(sdkTimeoutId);
+
+        console.log("[LoginView] Lecture Firestore SDK terminée.");
+        return {
+          exists: snap.exists(),
+          data: snap.exists() ? (snap.data() as Record<string, unknown>) : null,
+          source: "sdk",
+        };
+      } catch (sdkError: unknown) {
+        if (sdkTimeoutId !== undefined) window.clearTimeout(sdkTimeoutId);
+
+        console.warn(
+          "[LoginView] Lecture SDK Firestore échouée ou bloquée. Passage automatique à REST...",
+          sdkError
+        );
+
+        if (!sdkTimeoutTriggered && sdkError instanceof FirebaseError) {
+          console.error("[LoginView] Code Firestore SDK :", sdkError.code);
+          console.error("[LoginView] Message Firestore SDK :", sdkError.message);
+        }
+      }
+    } catch (sdkError: unknown) {
+      if (sdkTimeoutId !== undefined) window.clearTimeout(sdkTimeoutId);
+      console.warn("[LoginView] Exception SDK Firestore. Passage à REST...", sdkError);
+    }
+
+    const restData = await readUserProfileFromRest(user);
+
+    return {
+      exists: restData !== null,
+      data: restData,
+      source: "rest",
+    };
   };
 
   const logActivity = async (uid: string, provider: string) => {
@@ -422,16 +645,16 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
     const timeoutId = window.setTimeout(() => {
       if (!finished) {
         console.error(
-          "[LoginView] Firebase n'a pas répondu après 10 secondes."
+          "[LoginView] Firebase n'a pas répondu après 45 secondes."
         );
 
         finished = true;
         setCheckingSession(false);
         setError(
-          "La vérification de votre session a pris trop de temps. Vérifiez votre connexion Internet puis réessayez."
+          "La vérification de votre session a pris trop de temps. Le diagnostic Firestore a dépassé 45 secondes."
         );
       }
-    }, 10000);
+    }, 45000);
 
     const unsubscribe = onAuthStateChanged(
       auth,
@@ -477,39 +700,14 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
             return;
           }
 
-          // 1. Lecture du profil Firestore en priorité.
-          // Le profil doit pouvoir être chargé même si une mise à jour secondaire
-          // (lastLogin/emailVerified) rencontre un problème.
-          console.log(
-            "[LoginView] Lecture du profil Firestore users/" +
-              firebaseUser.uid +
-              "..."
-          );
-
-          const userPromise = getDoc(
-            doc(db, "users", firebaseUser.uid)
-          );
-
-          const firestoreTimeout = new Promise<never>((_, reject) => {
-            window.setTimeout(() => {
-              reject(
-                new Error(
-                  "Le profil utilisateur n'a pas pu être chargé après 10 secondes. Vérifiez votre connexion Internet et votre connexion à Firestore."
-                )
-              );
-            }, 10000);
-          });
-
-          const snap = await Promise.race([
-            userPromise,
-            firestoreTimeout,
-          ]);
+          // 1. Lecture du profil Firestore : SDK puis REST automatique si le SDK bloque.
+          const profile = await readUserProfile(firebaseUser, "session");
 
           console.log(
-            "[LoginView] Lecture Firestore terminée."
+            `[LoginView] Profil Firestore lu via ${profile.source.toUpperCase()}.`
           );
 
-          if (!snap.exists()) {
+          if (!profile.exists || !profile.data) {
             console.warn(
               "[LoginView] Aucun profil Firestore trouvé pour cet utilisateur."
             );
@@ -520,7 +718,7 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
 
           const appUser = {
             id: firebaseUser.uid,
-            ...snap.data(),
+            ...profile.data,
           } as AppUser;
 
           // 2. Connexion à l'application immédiatement après lecture du profil.
@@ -703,145 +901,77 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
   };
 
   const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
+  e.preventDefault();
 
-    setError("");
-    setSuccess("");
-    setLoading(true);
+  setError("");
+  setSuccess("");
+  setLoading(true);
 
-    try {
-      // 1. Authentification Firebase
-      const credential = await signInWithEmailAndPassword(
-        auth,
-        email.trim(),
-        password
+  try {
+    // 1. Authentification Firebase
+    const credential = await signInWithEmailAndPassword(
+      auth,
+      email.trim(),
+      password
+    );
+
+    // 2. Vérification de l'adresse e-mail
+    if (!credential.user.emailVerified) {
+      await signOut(auth);
+      setError(
+        "Veuillez vérifier votre adresse e-mail avant de vous connecter."
       );
-
-      console.log("[LoginView] Authentification Firebase réussie.");
-
-      // 2. Vérification de l'adresse e-mail
-      if (!credential.user.emailVerified) {
-        await signOut(auth);
-        setError(
-          "Veuillez vérifier votre adresse e-mail avant de vous connecter."
-        );
-        return;
-      }
-
-      // 3. Lecture EXPLICITE depuis le serveur Firestore.
-      // getDoc() peut attendre le mécanisme de synchronisation local avant
-      // de terminer. getDocFromServer() teste directement la lecture serveur.
-      const userRef = doc(db, "users", credential.user.uid);
-
-      console.log(
-        "[LoginView] Lecture Firestore depuis le serveur : users/" +
-          credential.user.uid
-      );
-
-      const firestoreReadPromise = getDocFromServer(userRef);
-
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        window.setTimeout(() => {
-          reject(
-            new Error(
-              "TIMEOUT_FIRESTORE: Firestore n'a pas répondu à la lecture du profil après 15 secondes."
-            )
-          );
-        }, 15000);
-      });
-
-      let snap;
-
-      try {
-        snap = await Promise.race([
-          firestoreReadPromise,
-          timeoutPromise,
-        ]);
-      } catch (firestoreError: unknown) {
-        console.error(
-          "[LoginView] ERREUR RÉELLE DE LECTURE FIRESTORE :",
-          firestoreError
-        );
-
-        if (firestoreError instanceof FirebaseError) {
-          console.error(
-            "[LoginView] Code Firestore :",
-            firestoreError.code
-          );
-          console.error(
-            "[LoginView] Message Firestore :",
-            firestoreError.message
-          );
-
-          throw new Error(
-            `Firestore (${firestoreError.code}) : ${firestoreError.message}`
-          );
-        }
-
-        throw firestoreError;
-      }
-
-      console.log(
-        "[LoginView] Lecture Firestore depuis le serveur terminée."
-      );
-
-      if (!snap.exists()) {
-        await signOut(auth);
-        throw new Error(
-          "Utilisateur authentifié, mais aucun profil n'existe dans Firestore (collection users)."
-        );
-      }
-
-      const loggedInUser = {
-        id: credential.user.uid,
-        ...snap.data()
-      } as AppUser;
-
-      console.log("[LoginView] Profil Firestore récupéré avec succès.");
-
-      // 4. Connexion à l'application
-      onLoginRef.current(loggedInUser);
-
-      setMode("login");
-      clearForm();
-
-      // 5. Ces opérations sont secondaires et non bloquantes.
-      void updateLastLoginAndEmailVerification(
-        credential.user
-      ).catch((err: unknown) => {
-        console.warn(
-          "[LoginView] Mise à jour secondaire du profil non bloquante :",
-          err
-        );
-      });
-
-      void logActivity(
-        credential.user.uid,
-        "password"
-      ).catch((err: unknown) => {
-        console.warn(
-          "[LoginView] Historisation de la connexion non bloquante :",
-          err
-        );
-      });
-
-    } catch (err: unknown) {
-      console.error("Erreur de connexion :", err);
-      setError(formatAuthError(err));
-
-      try {
-        await signOut(auth);
-      } catch (signOutError) {
-        console.error(
-          "[LoginView] Erreur lors de la déconnexion après échec :",
-          signOutError
-        );
-      }
-
-    } finally {
-      setLoading(false);
+      return;
     }
-  };
+
+    // 3. Récupération du profil utilisateur : SDK puis REST automatique.
+    const profile = await readUserProfile(credential.user, "login");
+
+    console.log(
+      `[LoginView] Profil Firestore lu via ${profile.source.toUpperCase()}.`
+    );
+
+    if (!profile.exists || !profile.data) {
+      await signOut(auth);
+      throw new Error("Utilisateur introuvable dans Firestore.");
+    }
+
+    const loggedInUser = {
+      id: credential.user.uid,
+      ...profile.data
+    } as AppUser;
+
+    // 4. Connexion à l'application
+    onLoginRef.current(loggedInUser);
+
+    setMode("login");
+    clearForm();
+
+    // 5. Ces opérations sont secondaires :
+    //    elles ne doivent pas bloquer l'ouverture du dashboard.
+    void updateLastLoginAndEmailVerification(
+      credential.user
+    );
+
+    void logActivity(
+      credential.user.uid,
+      "password"
+    );
+
+  } catch (err: unknown) {
+    console.error(
+      "Erreur de connexion :",
+      err
+    );
+
+    setError(
+      formatAuthError(err)
+    );
+
+  } finally {
+    setLoading(false);
+  }
+};
 
   const handleResendVerification = async () => {
     setError("");
@@ -917,8 +1047,9 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
     try {
       setLoading(true);
       const credential = await signInWithPopup(auth, googleProvider);
-      const snap = await getDoc(doc(db, "users", credential.user.uid));
-      if (!snap.exists()) {
+      const profile = await readUserProfile(credential.user, "google");
+
+      if (!profile.exists || !profile.data) {
         setPendingGoogleUser(credential.user);
         setFullName(credential.user.displayName || "");
         setMode("complete_profile");
@@ -926,7 +1057,7 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
         await updateLastLoginAndEmailVerification(credential.user);
         await logActivity(credential.user.uid, "google.com");
         
-        const loggedInUser = { id: credential.user.uid, ...snap.data() } as AppUser;
+        const loggedInUser = { id: credential.user.uid, ...profile.data } as AppUser;
         
         onLoginRef.current(loggedInUser);
         setMode("login");
