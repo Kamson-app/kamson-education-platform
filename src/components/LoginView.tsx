@@ -411,33 +411,78 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
     }
   };
 
-  // Écouteur de session
+  // Écouteur de session Firebase
   useEffect(() => {
+    console.log("[LoginView] Initialisation de la vérification de session Firebase...");
+
+    let finished = false;
+
+    // Sécurité : empêcher l'écran "Chargement..." de rester bloqué indéfiniment
+    const timeoutId = window.setTimeout(() => {
+      if (!finished) {
+        console.error("[LoginView] Firebase n'a pas répondu après 10 secondes.");
+        finished = true;
+        setCheckingSession(false);
+        setError("La vérification de votre session a pris trop de temps. Vérifiez votre connexion Internet puis réessayez.");
+      }
+    }, 10000);
+
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
-      if (firebaseUser) {
-        if (getProviderId(firebaseUser) === "password" && !firebaseUser.emailVerified) {
+      if (finished) return;
+
+      console.log("[LoginView] Réponse Firebase Authentication :", firebaseUser
+        ? { uid: firebaseUser.uid, email: firebaseUser.email, emailVerified: firebaseUser.emailVerified, provider: getProviderId(firebaseUser) }
+        : "Aucune session active");
+
+      try {
+        if (!firebaseUser) {
+          finished = true;
+          window.clearTimeout(timeoutId);
           setCheckingSession(false);
           return;
         }
-        try {
-          await updateLastLoginAndEmailVerification(firebaseUser);
-          
-          const snap = await getDoc(doc(db, "users", firebaseUser.uid));
-          if (snap.exists()) {
-            const appUser = { id: firebaseUser.uid, ...snap.data() } as AppUser;
-            onLoginRef.current(appUser);
-          } else {
-            await signOut(auth);
-          }
-        } catch (err) { 
-          console.error("Échec de chargement ou utilisateur inexistant :", err);
+
+        if (getProviderId(firebaseUser) === "password" && !firebaseUser.emailVerified) {
+          console.log("[LoginView] Compte trouvé mais adresse e-mail non vérifiée.");
+          await signOut(auth);
+          finished = true;
+          window.clearTimeout(timeoutId);
+          setCheckingSession(false);
+          return;
+        }
+
+        await updateLastLoginAndEmailVerification(firebaseUser);
+        const snap = await getDoc(doc(db, "users", firebaseUser.uid));
+
+        if (snap.exists()) {
+          const appUser = { id: firebaseUser.uid, ...snap.data() } as AppUser;
+          console.log("[LoginView] Profil utilisateur récupéré avec succès.");
+          onLoginRef.current(appUser);
+        } else {
+          console.warn("[LoginView] Aucun profil Firestore trouvé. Déconnexion.");
           await signOut(auth);
         }
+      } catch (err) {
+        console.error("[LoginView] Erreur pendant la vérification de session :", err);
+        try {
+          await signOut(auth);
+        } catch (signOutError) {
+          console.error("[LoginView] Erreur lors de la déconnexion :", signOutError);
+        }
+        setError("Impossible de charger votre session. Veuillez réessayer.");
+      } finally {
+        if (!finished) {
+          finished = true;
+          window.clearTimeout(timeoutId);
+          setCheckingSession(false);
+        }
       }
-      setCheckingSession(false);
     });
 
-    return () => unsubscribe();
+    return () => {
+      window.clearTimeout(timeoutId);
+      unsubscribe();
+    };
   }, []);
 
   if (checkingSession) {
@@ -660,7 +705,6 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
     try {
       setLoading(true);
 
-      // Connexion temporaire pour obtenir l'objet Firebase User.
       const credential = await signInWithEmailAndPassword(
         auth,
         normalizedEmail,
