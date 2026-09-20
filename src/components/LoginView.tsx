@@ -417,67 +417,171 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
 
     let finished = false;
 
-    // Sécurité : empêcher l'écran "Chargement..." de rester bloqué indéfiniment
+    // Sécurité : empêcher l'écran "Chargement..." de rester bloqué indéfiniment.
     const timeoutId = window.setTimeout(() => {
       if (!finished) {
-        console.error("[LoginView] Firebase n'a pas répondu après 10 secondes.");
+        console.error(
+          "[LoginView] Firebase n'a pas répondu après 10 secondes."
+        );
+
         finished = true;
         setCheckingSession(false);
-        setError("La vérification de votre session a pris trop de temps. Vérifiez votre connexion Internet puis réessayez.");
+        setError(
+          "La vérification de votre session a pris trop de temps. Vérifiez votre connexion Internet puis réessayez."
+        );
       }
     }, 10000);
 
-    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
-      if (finished) return;
+    const unsubscribe = onAuthStateChanged(
+      auth,
+      async (firebaseUser) => {
+        if (finished) return;
 
-      console.log("[LoginView] Réponse Firebase Authentication :", firebaseUser
-        ? { uid: firebaseUser.uid, email: firebaseUser.email, emailVerified: firebaseUser.emailVerified, provider: getProviderId(firebaseUser) }
-        : "Aucune session active");
+        console.log(
+          "[LoginView] Réponse Firebase Authentication :",
+          firebaseUser
+            ? {
+                uid: firebaseUser.uid,
+                email: firebaseUser.email,
+                emailVerified: firebaseUser.emailVerified,
+                provider: getProviderId(firebaseUser),
+              }
+            : "Aucune session active"
+        );
 
-      try {
-        if (!firebaseUser) {
-          finished = true;
-          window.clearTimeout(timeoutId);
-          setCheckingSession(false);
-          return;
-        }
-
-        if (getProviderId(firebaseUser) === "password" && !firebaseUser.emailVerified) {
-          console.log("[LoginView] Compte trouvé mais adresse e-mail non vérifiée.");
-          await signOut(auth);
-          finished = true;
-          window.clearTimeout(timeoutId);
-          setCheckingSession(false);
-          return;
-        }
-
-        await updateLastLoginAndEmailVerification(firebaseUser);
-        const snap = await getDoc(doc(db, "users", firebaseUser.uid));
-
-        if (snap.exists()) {
-          const appUser = { id: firebaseUser.uid, ...snap.data() } as AppUser;
-          console.log("[LoginView] Profil utilisateur récupéré avec succès.");
-          onLoginRef.current(appUser);
-        } else {
-          console.warn("[LoginView] Aucun profil Firestore trouvé. Déconnexion.");
-          await signOut(auth);
-        }
-      } catch (err) {
-        console.error("[LoginView] Erreur pendant la vérification de session :", err);
         try {
-          await signOut(auth);
-        } catch (signOutError) {
-          console.error("[LoginView] Erreur lors de la déconnexion :", signOutError);
-        }
-        setError("Impossible de charger votre session. Veuillez réessayer.");
-      } finally {
-        if (!finished) {
-          finished = true;
-          window.clearTimeout(timeoutId);
-          setCheckingSession(false);
+          // Aucun utilisateur connecté : afficher directement la page de connexion.
+          if (!firebaseUser) {
+            finished = true;
+            window.clearTimeout(timeoutId);
+            setCheckingSession(false);
+            return;
+          }
+
+          // Compte e-mail/mot de passe non vérifié :
+          // on ne laisse pas la session entrer dans l'application.
+          if (
+            getProviderId(firebaseUser) === "password" &&
+            !firebaseUser.emailVerified
+          ) {
+            console.log(
+              "[LoginView] Compte trouvé mais adresse e-mail non vérifiée."
+            );
+
+            await signOut(auth);
+
+            finished = true;
+            window.clearTimeout(timeoutId);
+            setCheckingSession(false);
+            return;
+          }
+
+          // 1. Lecture du profil Firestore en priorité.
+          // Le profil doit pouvoir être chargé même si une mise à jour secondaire
+          // (lastLogin/emailVerified) rencontre un problème.
+          console.log(
+            "[LoginView] Lecture du profil Firestore users/" +
+              firebaseUser.uid +
+              "..."
+          );
+
+          const userPromise = getDoc(
+            doc(db, "users", firebaseUser.uid)
+          );
+
+          const firestoreTimeout = new Promise<never>((_, reject) => {
+            window.setTimeout(() => {
+              reject(
+                new Error(
+                  "Le profil utilisateur n'a pas pu être chargé après 10 secondes. Vérifiez votre connexion Internet et votre connexion à Firestore."
+                )
+              );
+            }, 10000);
+          });
+
+          const snap = await Promise.race([
+            userPromise,
+            firestoreTimeout,
+          ]);
+
+          console.log(
+            "[LoginView] Lecture Firestore terminée."
+          );
+
+          if (!snap.exists()) {
+            console.warn(
+              "[LoginView] Aucun profil Firestore trouvé pour cet utilisateur."
+            );
+
+            await signOut(auth);
+            throw new Error("Utilisateur introuvable dans Firestore.");
+          }
+
+          const appUser = {
+            id: firebaseUser.uid,
+            ...snap.data(),
+          } as AppUser;
+
+          // 2. Connexion à l'application immédiatement après lecture du profil.
+          console.log(
+            "[LoginView] Profil utilisateur récupéré avec succès."
+          );
+
+          onLoginRef.current(appUser);
+
+          // 3. Ces opérations sont secondaires :
+          // elles ne doivent pas empêcher l'ouverture du dashboard.
+          void updateLastLoginAndEmailVerification(firebaseUser).catch(
+            (err: unknown) => {
+              console.warn(
+                "[LoginView] Mise à jour secondaire du profil non bloquante :",
+                err
+              );
+            }
+          );
+
+          void logActivity(
+            firebaseUser.uid,
+            getProviderId(firebaseUser) === "google.com"
+              ? "google.com"
+              : "password"
+          ).catch((err: unknown) => {
+            console.warn(
+              "[LoginView] Historisation de la connexion non bloquante :",
+              err
+            );
+          });
+        } catch (err) {
+          console.error(
+            "[LoginView] Erreur pendant la vérification de session :",
+            err
+          );
+
+          try {
+            await signOut(auth);
+          } catch (signOutError) {
+            console.error(
+              "[LoginView] Erreur lors de la déconnexion :",
+              signOutError
+            );
+          }
+
+          if (err instanceof Error) {
+            setError(err.message);
+          } else {
+            setError(
+              "Impossible de charger votre session. Veuillez réessayer."
+            );
+          }
+        } finally {
+          if (!finished) {
+            finished = true;
+            window.clearTimeout(timeoutId);
+            setCheckingSession(false);
+          }
         }
       }
-    });
+    );
 
     return () => {
       window.clearTimeout(timeoutId);
@@ -1446,4 +1550,4 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
       </div>
     </div>
   );
-}
+} 
