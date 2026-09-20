@@ -22,8 +22,8 @@ import { FirebaseError } from "firebase/app";
 import { 
   doc, 
   setDoc, 
-  getDoc, 
-  getDocFromServer,
+  getDoc,
+  getDocFromServer, 
   updateDoc, 
   serverTimestamp, 
   collection, 
@@ -281,13 +281,16 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
       );
     }
 
-    console.log("[LoginView] Test REST Firestore pour le profil utilisateur...");
+    console.log(
+      "[LoginView] Test REST Firestore sans ID token pour le profil utilisateur..."
+    );
 
-    const idToken = await user.getIdToken();
     const documentPath = `users/${encodeURIComponent(user.uid)}`;
     const url =
       `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}` +
       `/databases/(default)/documents/${documentPath}`;
+
+    console.log("[LoginView] URL REST Firestore :", url);
 
     let response: Response;
 
@@ -298,7 +301,6 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
           method: "GET",
           headers: {
             Accept: "application/json",
-            Authorization: `Bearer ${idToken}`,
           },
         },
         FIRESTORE_REST_TIMEOUT_MS
@@ -313,7 +315,9 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
     }
 
     if (response.status === 404) {
-      console.warn("[LoginView] REST Firestore : profil utilisateur introuvable (404).");
+      console.warn(
+        "[LoginView] REST Firestore : profil utilisateur introuvable (404)."
+      );
       return null;
     }
 
@@ -343,11 +347,16 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
     }
 
     if (!payload?.fields) {
-      console.warn("[LoginView] REST Firestore : réponse sans champs.");
+      console.warn(
+        "[LoginView] REST Firestore : réponse sans champs."
+      );
       return {};
     }
 
-    console.log("[LoginView] REST Firestore : lecture du profil réussie.");
+    console.log(
+      "[LoginView] REST Firestore : lecture du profil réussie sans ID token."
+    );
+
     return parseFirestoreRestDocument(payload);
   };
 
