@@ -22,7 +22,8 @@ import { FirebaseError } from "firebase/app";
 import { 
   doc, 
   setDoc, 
-  getDoc, 
+  getDoc,
+  getDocFromServer,
   updateDoc, 
   serverTimestamp, 
   collection, 
@@ -702,93 +703,145 @@ export default function LoginView({ onLogin, establishment }: LoginViewProps) {
   };
 
   const handleLogin = async (e: React.FormEvent) => {
-  e.preventDefault();
+    e.preventDefault();
 
-  setError("");
-  setSuccess("");
-  setLoading(true);
+    setError("");
+    setSuccess("");
+    setLoading(true);
 
-  try {
-    // 1. Authentification Firebase
-    const credential = await signInWithEmailAndPassword(
-      auth,
-      email.trim(),
-      password
-    );
-
-    // 2. Vérification de l'adresse e-mail
-    if (!credential.user.emailVerified) {
-      await signOut(auth);
-      setError(
-        "Veuillez vérifier votre adresse e-mail avant de vous connecter."
+    try {
+      // 1. Authentification Firebase
+      const credential = await signInWithEmailAndPassword(
+        auth,
+        email.trim(),
+        password
       );
-      return;
-    }
 
-    // 3. Récupération du profil utilisateur
-    //    avec une limite pour éviter le chargement infini.
-    const userPromise = getDoc(
-      doc(db, "users", credential.user.uid)
-    );
+      console.log("[LoginView] Authentification Firebase réussie.");
 
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      window.setTimeout(() => {
-        reject(
-          new Error(
-            "Le profil utilisateur n'a pas pu être chargé. Vérifiez votre connexion Internet et votre connexion à Firestore."
-          )
+      // 2. Vérification de l'adresse e-mail
+      if (!credential.user.emailVerified) {
+        await signOut(auth);
+        setError(
+          "Veuillez vérifier votre adresse e-mail avant de vous connecter."
         );
-      }, 10000);
-    });
+        return;
+      }
 
-    const snap = await Promise.race([
-      userPromise,
-      timeoutPromise
-    ]);
+      // 3. Lecture EXPLICITE depuis le serveur Firestore.
+      // getDoc() peut attendre le mécanisme de synchronisation local avant
+      // de terminer. getDocFromServer() teste directement la lecture serveur.
+      const userRef = doc(db, "users", credential.user.uid);
 
-    if (!snap.exists()) {
-      await signOut(auth);
-      throw new Error(
-        "Utilisateur introuvable dans Firestore."
+      console.log(
+        "[LoginView] Lecture Firestore depuis le serveur : users/" +
+          credential.user.uid
       );
+
+      const firestoreReadPromise = getDocFromServer(userRef);
+
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        window.setTimeout(() => {
+          reject(
+            new Error(
+              "TIMEOUT_FIRESTORE: Firestore n'a pas répondu à la lecture du profil après 15 secondes."
+            )
+          );
+        }, 15000);
+      });
+
+      let snap;
+
+      try {
+        snap = await Promise.race([
+          firestoreReadPromise,
+          timeoutPromise,
+        ]);
+      } catch (firestoreError: unknown) {
+        console.error(
+          "[LoginView] ERREUR RÉELLE DE LECTURE FIRESTORE :",
+          firestoreError
+        );
+
+        if (firestoreError instanceof FirebaseError) {
+          console.error(
+            "[LoginView] Code Firestore :",
+            firestoreError.code
+          );
+          console.error(
+            "[LoginView] Message Firestore :",
+            firestoreError.message
+          );
+
+          throw new Error(
+            `Firestore (${firestoreError.code}) : ${firestoreError.message}`
+          );
+        }
+
+        throw firestoreError;
+      }
+
+      console.log(
+        "[LoginView] Lecture Firestore depuis le serveur terminée."
+      );
+
+      if (!snap.exists()) {
+        await signOut(auth);
+        throw new Error(
+          "Utilisateur authentifié, mais aucun profil n'existe dans Firestore (collection users)."
+        );
+      }
+
+      const loggedInUser = {
+        id: credential.user.uid,
+        ...snap.data()
+      } as AppUser;
+
+      console.log("[LoginView] Profil Firestore récupéré avec succès.");
+
+      // 4. Connexion à l'application
+      onLoginRef.current(loggedInUser);
+
+      setMode("login");
+      clearForm();
+
+      // 5. Ces opérations sont secondaires et non bloquantes.
+      void updateLastLoginAndEmailVerification(
+        credential.user
+      ).catch((err: unknown) => {
+        console.warn(
+          "[LoginView] Mise à jour secondaire du profil non bloquante :",
+          err
+        );
+      });
+
+      void logActivity(
+        credential.user.uid,
+        "password"
+      ).catch((err: unknown) => {
+        console.warn(
+          "[LoginView] Historisation de la connexion non bloquante :",
+          err
+        );
+      });
+
+    } catch (err: unknown) {
+      console.error("Erreur de connexion :", err);
+      setError(formatAuthError(err));
+
+      try {
+        await signOut(auth);
+      } catch (signOutError) {
+        console.error(
+          "[LoginView] Erreur lors de la déconnexion après échec :",
+          signOutError
+        );
+      }
+
+    } finally {
+      setLoading(false);
     }
-
-    const loggedInUser = {
-      id: credential.user.uid,
-      ...snap.data()
-    } as AppUser;
-
-    // 4. Connexion à l'application
-    onLoginRef.current(loggedInUser);
-
-    setMode("login");
-    clearForm();
-
-    // 5. Ces opérations sont secondaires :
-    //    elles ne doivent pas bloquer l'ouverture du dashboard.
-    void updateLastLoginAndEmailVerification(
-      credential.user
-    );
-
-    void logActivity(
-      credential.user.uid,
-      "password"
-    );
-
-  } catch (err: unknown) {
-    console.error(
-      "Erreur de connexion :",
-      err
-    );
-
-    setError(
-      formatAuthError(err)
-    );
-
-  } finally {
-    setLoading(false);
-  }
-};
+  };
 
   const handleResendVerification = async () => {
     setError("");
